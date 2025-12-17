@@ -1,0 +1,4 @@
+USE tiktok_db;
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS region VARCHAR(100) NULL COMMENT '地区' AFTER sec_user_id;
+

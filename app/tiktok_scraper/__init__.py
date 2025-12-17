@@ -1,0 +1,5 @@
+"""
+Scrapy project package.
+"""
+
+

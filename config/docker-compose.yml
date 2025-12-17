@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  tiktok-app:
+    build: .
+    container_name: tiktok-app
+    restart: unless-stopped
+    
+    ports:
+      - "8888:8000"
+    
+    env_file:
+      - .env
+    
+    depends_on:
+      mysql:
+        condition: service_healthy
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    
+    volumes:
+      - ./logs:/app/logs
+      - /tmp/scrapy:/tmp/scrapy
+      - ../app:/app/app
+      - ../config/scrapy.cfg:/app/scrapy.cfg
+    
+    networks:
+      - tiktok-network
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  mysql:
+    image: mysql:8.0
+    container_name: tiktok-mysql
+    restart: unless-stopped
+    
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-tiktok_db}
+      MYSQL_USER: ${MYSQL_USER:-tiktok}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-password}
+      TZ: Asia/Shanghai
+    
+    volumes:
+      - ./mysql-data:/var/lib/mysql
+      - ../app/tiktok_scraper/database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    
+    ports:
+      - "3306:3306"
+    
+    networks:
+      - tiktok-network
+    
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+networks:
+  tiktok-network:
+    driver: bridge
+

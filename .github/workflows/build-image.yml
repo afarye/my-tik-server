@@ -1,0 +1,32 @@
+name: Build Docker image and upload artifact
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build image (multi-arch) and load
+        run: |
+          # Build using the config context so Dockerfile in config/ is used
+          docker buildx build --platform linux/amd64,linux/arm64 --load -t tik-server:latest -f config/Dockerfile config
+
+      - name: Save image to tar
+        run: |
+          docker save tik-server:latest -o tik-server-latest.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tik-server-image
+          path: tik-server-latest.tar
