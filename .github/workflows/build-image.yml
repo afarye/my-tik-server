@@ -16,10 +16,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      - name: Build image (multi-arch) and load
+      - name: Build image and load (single-arch)
         run: |
+          # Use single-platform build when using --load because buildx --load doesn't support multi-arch manifest export
           # Build using the config context so Dockerfile in config/ is used
-          docker buildx build --platform linux/amd64,linux/arm64 --load -t tik-server:latest -f config/Dockerfile config
+          docker buildx build --platform linux/amd64 --load -t tik-server:latest -f config/Dockerfile config
 
       - name: Save image to tar
         run: |
