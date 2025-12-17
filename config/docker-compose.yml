@@ -55,7 +55,7 @@ services:
     
     volumes:
       - ./mysql-data:/var/lib/mysql
-      - ../app/tiktok_scraper/database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
     
     ports:
       - "3306:3306"
