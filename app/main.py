@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="TikTok Scraper API", version="1.4.0")
+app = FastAPI(title="TikTok Scraper API", version="1.5.0")
 api_router = APIRouter(prefix="/api")
 
 @app.on_event("startup")
@@ -47,6 +47,7 @@ app.add_middleware(
 
 class CrawlRequest(BaseModel):
     urls: List[str]
+    sec_user_ids: Optional[List[str]] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     wait_time: Optional[float] = 2.0
@@ -146,130 +147,115 @@ async def health(db: Session = Depends(get_db)):
     
     return {
         "status": "ok",
-        "version": "1.2.0",
+        "version": "1.5.0",
         "database": db_status
     }
 
 @api_router.post("/crawl_scrapy")
 async def crawl_scrapy(request: CrawlRequest, db: Session = Depends(get_db)):
-    tmpdir = None
-    try:
-        tmpdir = tempfile.mkdtemp(prefix="scrapy_run_")
-        output_json = os.path.join(tmpdir, "tiktok_result.json")
+    tikhub_token = os.getenv("TIKHUB_TOKEN")
+    if not tikhub_token:
+        raise HTTPException(status_code=500, detail="TIKHUB_TOKEN环境变量未配置")
+    
+    if request.sec_user_ids and len(request.sec_user_ids) != len(request.urls):
+        raise HTTPException(status_code=400, detail="sec_user_ids数量必须与urls数量一致")
+    
+    results = []
+    logger.info(f"Starting crawl for {len(request.urls)} URLs using TikHub API")
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        headers = {"Authorization": f"Bearer {tikhub_token}"}
         
-        urls_arg = ",".join(request.urls)
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        app_dir = os.path.join(project_root, "app")
-        scrapy_cfg_path = os.path.join(app_dir, "scrapy.cfg")
-        
-        if not os.path.exists(scrapy_cfg_path):
-            with open(scrapy_cfg_path, "w") as f:
-                f.write("[settings]\n")
-                f.write("default = tiktok_scraper.settings\n\n")
-                f.write("[deploy]\n")
-                f.write("project = tiktok_scraper\n")
-        
-        cmd = [
-            sys.executable, "-m", "scrapy", "crawl", "tiktok",
-            "-a", f"urls={urls_arg}",
-            "-a", f"start_date={request.start_date or ''}",
-            "-a", f"end_date={request.end_date or ''}",
-            "-o", output_json,
-            "-s", f"SCRAPY_SETTINGS_MODULE=tiktok_scraper.settings"
-        ]
-        
-        logger.info(f"Starting crawl for {len(request.urls)} URLs")
-        
-        def run_cmd():
+        for idx, url in enumerate(request.urls):
             try:
-                env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-                env["PYTHONPATH"] = f"{app_dir}:{env.get('PYTHONPATH', '')}"
-                return subprocess.run(
-                    cmd, 
-                    cwd=app_dir, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE, 
-                    timeout=300,
-                    env=env
-                )
-            except subprocess.TimeoutExpired as e:
-                logger.error(f"Scrapy timeout: {e}")
-                raise
-            except Exception as e:
-                logger.error(f"Subprocess error: {e}")
-                raise
-        
-        proc = await asyncio.to_thread(run_cmd)
-        
-        if proc.returncode != 0:
-            stderr = proc.stderr.decode(errors="ignore")
-            logger.error(f"Scrapy error (exit {proc.returncode}): {stderr[:500]}")
-            return {
-                "success": False, 
-                "error": f"Scraping failed (exit code {proc.returncode})",
-                "details": stderr[:200] if stderr else "Unknown error"
-            }
-        
-        if not os.path.exists(output_json):
-            logger.error("Output file not found")
-            return {"success": False, "error": "Output file not created"}
-        
-        try:
-            with open(output_json, "r", encoding="utf-8") as f:
-                data = _json.load(f)
-            
-            if not isinstance(data, list):
-                data = [data] if data else []
-            
-            for item in data:
+                unique_id = None
+                if "@" in url:
+                    parts = url.split("@")
+                    if len(parts) > 1:
+                        unique_id = parts[1].split("/")[0].split("?")[0]
+                
+                sec_user_id = None
+                if request.sec_user_ids and idx < len(request.sec_user_ids):
+                    sec_user_id = request.sec_user_ids[idx]
+                
+                if not sec_user_id:
+                    logger.warning(f"sec_user_id not provided for {url}, skipping")
+                    results.append({
+                        "url": url,
+                        "error": "sec_user_id is required"
+                    })
+                    continue
+                
+                profile_url = "https://api.tikhub.io/api/v1/tiktok/app/v3/handler_user_profile"
+                params = {
+                    "sec_user_id": sec_user_id
+                }
+                if unique_id:
+                    params["unique_id"] = unique_id
+                
+                profile_response = await client.get(profile_url, headers=headers, params=params)
+                profile_response.raise_for_status()
+                profile_data = profile_response.json()
+                
+                if profile_data.get("code") != 200 or not profile_data.get("data", {}).get("user"):
+                    logger.error(f"TikHub API error for {url}: {profile_data}")
+                    results.append({
+                        "url": url,
+                        "error": profile_data.get("message", "Unknown error")
+                    })
+                    continue
+                
+                user_data = profile_data["data"]["user"]
+                
+                result_item = {
+                    "url": url,
+                    "username": user_data.get("unique_id") or unique_id,
+                    "following": str(user_data.get("following_count", 0)),
+                    "followers": str(user_data.get("follower_count", 0)),
+                    "likes": str(user_data.get("total_favorited", 0)),
+                    "video_count": str(user_data.get("aweme_count", 0)),
+                    "videos": None,
+                    "user_info": user_data
+                }
+                
                 try:
                     history = UserHistory(
-                        url=item.get("url", ""),
-                        username=item.get("username"),
-                        following=item.get("following"),
-                        followers=item.get("followers"),
-                        likes=item.get("likes"),
-                        video_count=item.get("video_count"),
-                        videos=item.get("videos"),
-                        user_info=item.get("user_info")
+                        url=result_item["url"],
+                        username=result_item["username"],
+                        following=result_item["following"],
+                        followers=result_item["followers"],
+                        likes=result_item["likes"],
+                        video_count=result_item["video_count"],
+                        videos=result_item["videos"],
+                        user_info=result_item["user_info"]
                     )
                     db.add(history)
                 except Exception as e:
                     logger.error(f"Error saving history: {e}")
-            
-            try:
-                db.commit()
+                
+                results.append(result_item)
+                
+            except httpx.HTTPStatusError as e:
+                logger.error(f"TikHub API error for {url}: {e.response.status_code} - {e.response.text}")
+                results.append({
+                    "url": url,
+                    "error": f"TikHub API error: {e.response.status_code}"
+                })
             except Exception as e:
-                db.rollback()
-                logger.error(f"Error committing history: {e}")
-            
-            logger.info(f"Successfully crawled {len(data)} results")
-            return {"success": True, "results": data, "count": len(data)}
-            
-        except _json.JSONDecodeError as e:
-            logger.error(f"JSON decode error: {e}")
-            return {"success": False, "error": "Invalid JSON output"}
+                logger.error(f"Error processing {url}: {e}")
+                results.append({
+                    "url": url,
+                    "error": str(e)
+                })
+        
+        try:
+            db.commit()
         except Exception as e:
-            logger.error(f"File read error: {e}")
-            return {"success": False, "error": f"Failed to read results: {str(e)}"}
-            
-    except asyncio.TimeoutError:
-        logger.error("Request timeout")
-        return {"success": False, "error": "Request timeout after 300 seconds"}
-    except Exception as e:
-        logger.error(f"Unexpected error: {traceback.format_exc()}")
-        return {
-            "success": False, 
-            "error": "Internal server error",
-            "details": str(e)[:200]
-        }
-    finally:
-        if tmpdir:
-            try:
-                import shutil
-                await asyncio.to_thread(shutil.rmtree, tmpdir, ignore_errors=True)
-            except Exception as e:
-                logger.warning(f"Cleanup error: {e}")
+            db.rollback()
+            logger.error(f"Error committing history: {e}")
+    
+    logger.info(f"Successfully crawled {len([r for r in results if 'error' not in r])} results")
+    return {"success": True, "results": results, "count": len(results)}
 
 @api_router.post("/tracks", response_model=TrackResponse)
 async def create_track(track: TrackCreate, db: Session = Depends(get_db)):
