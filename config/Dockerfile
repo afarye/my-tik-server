@@ -9,7 +9,7 @@ ENV PYTHONPATH=/app:$PYTHONPATH
 ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 # Copy only requirements from the config context and install them
-COPY requirements.txt /tmp/requirements.txt
+COPY config/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --default-timeout=1000 --retries 5 --prefer-binary -r /tmp/requirements.txt
 
 # Copy config files into the image. The application code is mounted at runtime
