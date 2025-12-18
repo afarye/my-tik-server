@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, APIRouter
+from fastapi import FastAPI, HTTPException, Depends, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
 from typing import List, Optional, Any, Dict
@@ -12,9 +12,13 @@ import tempfile
 import json as _json
 import logging
 import traceback
+import httpx
+from dotenv import load_dotenv
 
 from app.tiktok_scraper.database.models import User, Track, UserHistory, init_db
 from app.tiktok_scraper.database.db import get_db
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="TikTok Scraper API", version="1.2.0")
+app = FastAPI(title="TikTok Scraper API", version="1.4.0")
 api_router = APIRouter(prefix="/api")
 
 @app.on_event("startup")
@@ -78,11 +82,15 @@ class UserCreate(BaseModel):
     account: str
     track_id: int
     url: Optional[str] = None
+    region: Optional[str] = None
+    tags: Optional[Any] = None
 
 class UserUpdate(BaseModel):
     track_id: Optional[int] = None
     url: Optional[str] = None
     sec_user_id: Optional[str] = None
+    region: Optional[str] = None
+    tags: Optional[Any] = None
 
 class UpdateSecUserIdRequest(BaseModel):
     url: str
@@ -105,6 +113,8 @@ class UserResponse(BaseModel):
     track_name: Optional[str] = None
     url: Optional[str] = None
     sec_user_id: Optional[str] = None
+    region: Optional[str] = None
+    tags: Optional[Any] = None
     created_at: str
     updated_at: str
 
@@ -422,6 +432,8 @@ async def get_track_users(
                 track_name=track.name,
                 url=u.url,
                 sec_user_id=u.sec_user_id,
+                region=u.region,
+                tags=u.tags,
                 created_at=u.created_at.isoformat(),
                 updated_at=u.updated_at.isoformat()
             )
@@ -444,7 +456,13 @@ async def create_user(user: UserCreate, db: Session = Depends(get_db)):
         if not track:
             raise HTTPException(status_code=404, detail="Track not found")
         
-        db_user = User(account=user.account, track_id=user.track_id, url=user.url)
+        db_user = User(
+            account=user.account,
+            track_id=user.track_id,
+            url=user.url,
+            region=user.region,
+            tags=user.tags
+        )
         db.add(db_user)
         db.commit()
         db.refresh(db_user)
@@ -456,6 +474,8 @@ async def create_user(user: UserCreate, db: Session = Depends(get_db)):
             track_name=track.name,
             url=db_user.url,
             sec_user_id=db_user.sec_user_id,
+            region=db_user.region,
+            tags=db_user.tags,
             created_at=db_user.created_at.isoformat(),
             updated_at=db_user.updated_at.isoformat()
         )
@@ -494,6 +514,8 @@ async def get_users(
                 track_name=track.name if track else None,
                 url=u.url,
                 sec_user_id=u.sec_user_id,
+                region=u.region,
+                tags=u.tags,
                 created_at=u.created_at.isoformat(),
                 updated_at=u.updated_at.isoformat()
             ))
@@ -519,6 +541,8 @@ async def get_user(user_id: int, db: Session = Depends(get_db)):
             track_name=track.name if track else None,
             url=user.url,
             sec_user_id=user.sec_user_id,
+            region=user.region,
+            tags=user.tags,
             created_at=user.created_at.isoformat(),
             updated_at=user.updated_at.isoformat()
         )
@@ -544,6 +568,10 @@ async def update_user(user_id: int, user_update: UserUpdate, db: Session = Depen
             db_user.url = user_update.url
         if user_update.sec_user_id is not None:
             db_user.sec_user_id = user_update.sec_user_id
+        if user_update.region is not None:
+            db_user.region = user_update.region
+        if user_update.tags is not None:
+            db_user.tags = user_update.tags
         
         db.commit()
         db.refresh(db_user)
@@ -557,6 +585,8 @@ async def update_user(user_id: int, user_update: UserUpdate, db: Session = Depen
             track_name=track.name if track else None,
             url=db_user.url,
             sec_user_id=db_user.sec_user_id,
+            region=db_user.region,
+            tags=db_user.tags,
             created_at=db_user.created_at.isoformat(),
             updated_at=db_user.updated_at.isoformat()
         )
@@ -601,6 +631,8 @@ async def get_user_by_account(account: str, db: Session = Depends(get_db)):
             track_name=track.name if track else None,
             url=user.url,
             sec_user_id=user.sec_user_id,
+            region=user.region,
+            tags=user.tags,
             created_at=user.created_at.isoformat(),
             updated_at=user.updated_at.isoformat()
         )
@@ -731,6 +763,8 @@ async def update_sec_user_id(request: UpdateSecUserIdRequest, db: Session = Depe
             track_name=track.name if track else None,
             url=user.url,
             sec_user_id=user.sec_user_id,
+            region=user.region,
+            tags=user.tags,
             created_at=user.created_at.isoformat(),
             updated_at=user.updated_at.isoformat()
         )
@@ -740,6 +774,76 @@ async def update_sec_user_id(request: UpdateSecUserIdRequest, db: Session = Depe
         db.rollback()
         logger.error(f"Error updating sec_user_id: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/proxy/get-sec-user-id")
+async def get_sec_user_id(url: str = Query(..., description="TikTok用户URL")):
+    """转发请求到TikHub API获取sec_user_id"""
+    tikhub_token = os.getenv("TIKHUB_TOKEN")
+    if not tikhub_token:
+        raise HTTPException(status_code=500, detail="TIKHUB_TOKEN环境变量未配置")
+    
+    tikhub_url = f"https://api.tikhub.io/api/v1/tiktok/web/get_sec_user_id?url={url}"
+    headers = {
+        "Authorization": f"Bearer {tikhub_token}"
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(tikhub_url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as e:
+        logger.error(f"TikHub API error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(status_code=e.response.status_code, detail=f"TikHub API错误: {e.response.text}")
+    except httpx.RequestError as e:
+        logger.error(f"Request error: {e}")
+        raise HTTPException(status_code=500, detail=f"请求错误: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=f"未知错误: {str(e)}")
+
+@api_router.get("/proxy/fetch-user-post-videos")
+async def fetch_user_post_videos(
+    sec_user_id: str = Query(..., description="用户sec_user_id"),
+    unique_id: Optional[str] = Query(None, description="用户unique_id"),
+    max_cursor: Optional[int] = Query(None, description="分页游标"),
+    count: Optional[int] = Query(None, description="获取数量"),
+    sort_type: Optional[int] = Query(None, description="排序类型")
+):
+    """转发请求到TikHub API获取主页视频数据"""
+    tikhub_token = os.getenv("TIKHUB_TOKEN")
+    if not tikhub_token:
+        raise HTTPException(status_code=500, detail="TIKHUB_TOKEN环境变量未配置")
+    
+    params = {"sec_user_id": sec_user_id}
+    if unique_id:
+        params["unique_id"] = unique_id
+    if max_cursor is not None:
+        params["max_cursor"] = max_cursor
+    if count is not None:
+        params["count"] = count
+    if sort_type is not None:
+        params["sort_type"] = sort_type
+    
+    tikhub_url = "https://api.tikhub.io/api/v1/tiktok/app/v3/fetch_user_post_videos_v3"
+    headers = {
+        "Authorization": f"Bearer {tikhub_token}"
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(tikhub_url, headers=headers, params=params)
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as e:
+        logger.error(f"TikHub API error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(status_code=e.response.status_code, detail=f"TikHub API错误: {e.response.text}")
+    except httpx.RequestError as e:
+        logger.error(f"Request error: {e}")
+        raise HTTPException(status_code=500, detail=f"请求错误: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=f"未知错误: {str(e)}")
 
 app.include_router(api_router)
 
