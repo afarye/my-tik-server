@@ -14,11 +14,16 @@ import logging
 import traceback
 import httpx
 from dotenv import load_dotenv
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from pytz import timezone
 
-from app.tiktok_scraper.database.models import User, Track, UserHistory, init_db
+from app.tiktok_scraper.database.models import User, Track, UserHistory, init_db, SessionLocal
 from app.tiktok_scraper.database.db import get_db
 
 load_dotenv()
+
+scheduler = AsyncIOScheduler(timezone=timezone('Asia/Dubai'))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,13 +34,87 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="TikTok Scraper API", version="1.5.0")
 api_router = APIRouter(prefix="/api")
 
+async def monthly_fan_count_task():
+    """每月26号执行：查询所有用户的粉丝数并存入历史表"""
+    logger.info("开始执行每月粉丝数统计任务")
+    db = SessionLocal()
+    try:
+        tikhub_token = os.getenv("TIKHUB_TOKEN")
+        if not tikhub_token:
+            logger.error("TIKHUB_TOKEN未配置，跳过任务")
+            return
+        
+        users = db.query(User).all()
+        logger.info(f"查询到 {len(users)} 个用户")
+        
+        success_count = 0
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            headers = {"Authorization": f"Bearer {tikhub_token}"}
+            
+            for user in users:
+                try:
+                    if not user.sec_user_id:
+                        logger.warning(f"用户 {user.account} 缺少 sec_user_id，跳过")
+                        continue
+                    
+                    profile_url = "https://api.tikhub.io/api/v1/tiktok/app/v3/handler_user_profile"
+                    params = {"sec_user_id": user.sec_user_id}
+                    
+                    response = await client.get(profile_url, headers=headers, params=params)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if data.get("code") != 200 or not data.get("data", {}).get("user"):
+                        logger.error(f"获取用户 {user.account} 信息失败: {data}")
+                        continue
+                    
+                    user_data = data["data"]["user"]
+                    
+                    history = UserHistory(
+                        url=user.url or "",
+                        username=user_data.get("unique_id") or user.account,
+                        following=str(user_data.get("following_count", 0)),
+                        followers=str(user_data.get("follower_count", 0)),
+                        likes=str(user_data.get("total_favorited", 0)),
+                        video_count=str(user_data.get("aweme_count", 0)),
+                        videos=None,
+                        user_info=user_data
+                    )
+                    db.add(history)
+                    success_count += 1
+                    logger.info(f"已记录用户 {user.account} 的粉丝数: {user_data.get('follower_count', 0)}")
+                    
+                except Exception as e:
+                    logger.error(f"处理用户 {user.account} 时出错: {e}")
+                    continue
+        
+        db.commit()
+        logger.info(f"每月粉丝数统计任务完成，成功记录 {success_count}/{len(users)} 个用户")
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"每月粉丝数统计任务失败: {e}")
+    finally:
+        db.close()
+
 @app.on_event("startup")
 async def startup_event():
     try:
         init_db()
         logger.info("Database initialized successfully")
+        
+        scheduler.add_job(
+            monthly_fan_count_task,
+            CronTrigger(day=26, hour=0, minute=0, timezone=timezone('Asia/Dubai')),
+            id='monthly_fan_count',
+            name='每月26号统计粉丝数',
+            replace_existing=True
+        )
+        scheduler.start()
+        logger.info("定时任务调度器已启动，每月26号00:00(迪拜时区)执行粉丝数统计")
+        
     except Exception as e:
-        logger.error(f"Database initialization error: {e}")
+        logger.error(f"Startup error: {e}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -96,6 +175,12 @@ class UserUpdate(BaseModel):
 class UpdateSecUserIdRequest(BaseModel):
     url: str
     sec_user_id: str
+
+class AddTagsRequest(BaseModel):
+    tags: Any
+
+class UpdateTagsRequest(BaseModel):
+    tags: Any
 
 class UserHistoryCreate(BaseModel):
     url: str
@@ -646,6 +731,80 @@ async def delete_user_by_account(account: str, db: Session = Depends(get_db)):
         logger.error(f"Error deleting user by account: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@api_router.post("/tags/user/{user_id}", response_model=UserResponse)
+async def add_user_tags(user_id: int, request: AddTagsRequest, db: Session = Depends(get_db)):
+    try:
+        db_user = db.query(User).filter(User.id == user_id).first()
+        if not db_user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        current_tags = db_user.tags if db_user.tags else []
+        new_tags = request.tags
+        
+        if isinstance(current_tags, list) and isinstance(new_tags, list):
+            combined_tags = list(set(current_tags + new_tags))
+        elif isinstance(current_tags, dict) and isinstance(new_tags, dict):
+            combined_tags = {**current_tags, **new_tags}
+        else:
+            combined_tags = new_tags
+        
+        db_user.tags = combined_tags
+        db.commit()
+        db.refresh(db_user)
+        
+        track = db.query(Track).filter(Track.id == db_user.track_id).first()
+        
+        return UserResponse(
+            id=db_user.id,
+            account=db_user.account,
+            track_id=db_user.track_id,
+            track_name=track.name if track else None,
+            url=db_user.url,
+            sec_user_id=db_user.sec_user_id,
+            region=db_user.region,
+            tags=db_user.tags,
+            created_at=db_user.created_at.isoformat(),
+            updated_at=db_user.updated_at.isoformat()
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error adding user tags: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.put("/tags/user/{user_id}", response_model=UserResponse)
+async def update_user_tags(user_id: int, request: UpdateTagsRequest, db: Session = Depends(get_db)):
+    try:
+        db_user = db.query(User).filter(User.id == user_id).first()
+        if not db_user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        db_user.tags = request.tags
+        db.commit()
+        db.refresh(db_user)
+        
+        track = db.query(Track).filter(Track.id == db_user.track_id).first()
+        
+        return UserResponse(
+            id=db_user.id,
+            account=db_user.account,
+            track_id=db_user.track_id,
+            track_name=track.name if track else None,
+            url=db_user.url,
+            sec_user_id=db_user.sec_user_id,
+            region=db_user.region,
+            tags=db_user.tags,
+            created_at=db_user.created_at.isoformat(),
+            updated_at=db_user.updated_at.isoformat()
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating user tags: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @api_router.get("/history-user", response_model=List[UserHistoryResponse])
 async def get_user_history(
     url: str,
@@ -831,7 +990,22 @@ async def fetch_user_post_videos(
         logger.error(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=f"未知错误: {str(e)}")
 
+@api_router.post("/task/monthly-fan-count")
+async def trigger_monthly_fan_count():
+    """手动触发每月粉丝数统计任务"""
+    try:
+        await monthly_fan_count_task()
+        return {"success": True, "message": "任务执行完成"}
+    except Exception as e:
+        logger.error(f"手动触发任务失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 app.include_router(api_router)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    scheduler.shutdown()
+    logger.info("定时任务调度器已关闭")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
